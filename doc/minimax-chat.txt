@@ -1,0 +1,115 @@
+*minimax-chat.txt*      Nvim plugin for MiniMax AI chat
+
+Author: minimax-chat contributors
+License: MIT
+
+==============================================================================
+INTRODUCTION                                     *minimax-chat-intro*
+
+minimax-chat is a Neovim plugin that lets you chat with MiniMax AI models
+using the `mmx` CLI client. The entire file is your conversation history.
+Write in `[USER]` blocks, get responses in `[ASSISTANT]` blocks.
+
+Requirements: `mmx` CLI installed and API key configured.
+
+==============================================================================
+SETUP                                            *minimax-chat-setup*
+
+`lua require('minimax-chat').setup({opts})`
+
+Default options:
+>
+    {
+        model = "MiniMax-M2.7",
+        stream = true,
+        timeout = 60
+    }
+<
+
+Example:
+>
+    require('minimax-chat').setup({
+        model = "MiniMax-M2.7-highspeed",
+    })
+<
+
+==============================================================================
+USAGE                                            *minimax-chat-usage*
+
+1. Open any buffer and write your conversation using markers.
+2. Press Shift-Enter to send the entire buffer to MiniMax.
+3. The model response is streamed to the buffer bottom.
+
+Example conversation:
+>
+    [SYSTEM]
+    You are a helpful assistant.
+
+    [USER]
+    What is Lua?
+
+    [ASSISTANT]
+    (model response will appear here)
+<
+
+==============================================================================
+COMMANDS                                         *minimax-chat-commands*
+
+:MmxSend          *:MmxSend*
+    Send current buffer content to MiniMax. Parses [SYSTEM], [USER],
+    and [ASSISTANT] markers, sends as conversation history, and appends
+    the model response to the buffer.
+
+:MmxChatNew       *:MmxChatNew*
+    Create a new buffer with a conversation template:
+    [SYSTEM], empty line, [USER], empty line.
+
+==============================================================================
+MARKERS                                          *minimax-chat-markers*
+
+[SYSTEM]     *minimax-chat-system*
+    System prompt - placed at the top of the file. Sets the AI's role.
+    Optional. The content after [SYSTEM] is sent as the system message.
+
+[USER]       *minimax-chat-user*
+    User message marker. Everything between [USER] and the next marker
+    is sent as a user message. Consecutive [USER] blocks are merged.
+
+[ASSISTANT]  *minimax-chat-assistant*
+    Assistant response marker. The model's response is inserted after
+    this marker. Also used in conversation history for context.
+
+[THINKING]   *minimax-chat-thinking*
+    Model reasoning marker. If the model outputs thinking content
+    (chain-of-thought), it appears in a [THINKING] block before the
+    [ASSISTANT] response.
+
+==============================================================================
+KEYMAPS                                          *minimax-chat-keymaps*
+
+<S-Enter>     *minimax-chat-<S-Enter>*
+    In normal mode: send current buffer content to MiniMax.
+    Equivalent to running :MmxSend.
+
+==============================================================================
+CONFIGURATION                                    *minimax-chat-config*
+
+Available options:
+
+    model       *minimax-chat-config-model*
+        MiniMax model ID. Default: "MiniMax-M2.7"
+        Other options: "MiniMax-M2.7-highspeed"
+
+    stream      *minimax-chat-config-stream*
+        Whether to stream responses. Default: true
+
+    timeout     *minimax-chat-config-timeout*
+        Job timeout in seconds. Default: 60
+
+==============================================================================
+ABOUT                                            *minimax-chat-about*
+
+Homepage: https://github.com/user/minimax-chat.nvim
+Requires: mmx CLI (npm install -g mmx-cli)
+
+vim:tw=78:ts=8:ft=help:norl:
