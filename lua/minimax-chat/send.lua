@@ -5,63 +5,68 @@ local M = {
   current_job_id = nil,
 }
 
---- Extract [SEARCH]<query> marker from content and return cleaned content.
--- @param content string: Message content to scan
--- @return table: { query = string|nil, cleaned = string }
-local function extract_search_query(content)
-  local query = nil
-  local cleaned = content:gsub("%]%s*\n", "]\n")  -- normalize
-  cleaned = cleaned:gsub("%[SEARCH%](.-)\n?", function(match)
-    local q = vim.trim(match)
-    if q ~= "" then
-      query = q
+-- Tool definition for MiniMax Messages API (flattened format, NOT Anthropic SDK format)
+local WEB_SEARCH_TOOL = {
+  name = "web_search",
+  description = "Search the web for current information. Use this when you need to find up-to-date facts, weather, news, or anything that requires real-time data.",
+  input_schema = {
+    type = "object",
+    properties = {
+      query = {
+        type = "string",
+        description = "The search query. Be specific and include key details like location, date, etc."
+      }
+    },
+    required = { "query" }
+  }
+}
+
+--- Check if content array contains a tool_use block.
+local function has_tool_call(content)
+  if not content then return nil, nil end
+  for _, item in ipairs(content) do
+    if item.type == "tool_use" then
+      return item.name, item.input
     end
-    return ""
-  end)
-  cleaned = vim.trim(cleaned)
-  return { query = query, cleaned = cleaned }
+  end
+  return nil, nil
 end
 
---- Format JSON search results as [CONTEXT] block.
--- @param json_str string: JSON string from mmx search
--- @return string: Formatted context block
-local function format_context(json_str)
-  local ok, data = pcall(vim.fn.json_decode, json_str)
+--- Build a tool result content block from raw JSON result.
+local function build_tool_result_content(name, input, raw_result)
+  local ok, data = pcall(vim.fn.json_decode, raw_result)
   if not ok or not data then
-    return "[CONTEXT]\nFailed to parse search results.\n"
+    return string.format("Tool: %s failed: could not parse result", name)
   end
 
-  local organic = data.organic
-  if not organic or #organic == 0 then
-    return "[CONTEXT]\nNo search results found.\n"
-  end
+  local organic = data.organic or {}
+  local lines = { string.format("Tool: %s", name) }
 
-  local results = {}
-  local max_entries = math.min(5, #organic)
+  if name == "web_search" then
+    local query = input and input.query or "unknown"
+    table.insert(lines, string.format("Query: %s", query))
+    table.insert(lines, "Results:")
 
-  table.insert(results, "[CONTEXT]")
-  table.insert(results, "Search results:\n")
-
-  for i = 1, max_entries do
-    local entry = organic[i]
-    local title = entry.title or "No title"
-    local snippet = entry.snippet or ""
-    local link = entry.link or ""
-
-    -- Truncate snippet to 200 chars
-    if #snippet > 200 then
-      snippet = snippet:sub(1, 200) .. "..."
+    if #organic == 0 then
+      table.insert(lines, "  No results found.")
+    else
+      local max_entries = math.min(5, #organic)
+      for i = 1, max_entries do
+        local item = organic[i]
+        local title = item.title or "No title"
+        local snippet = (item.snippet or ""):sub(1, 150)
+        local link = item.link or ""
+        table.insert(lines, string.format("%d. %s: %s (%s)", i, title, snippet, link))
+      end
     end
-
-    table.insert(results, string.format("%d. **%s**\n   %s\n   %s\n", i, title, snippet, link))
+  else
+    table.insert(lines, vim.fn.json_encode(data))
   end
 
-  return table.concat(results, "\n")
+  return table.concat(lines, "\n")
 end
 
 --- Execute web search via mmx CLI.
--- @param query string: Search query
--- @param callback function: Callback(context_string, err_message)
 local function execute_search(query, callback)
   local args = { "mmx", "search", "query", "--q", query, "--output", "json" }
   local output_parts = {}
@@ -90,9 +95,12 @@ local function execute_search(query, callback)
     vim.fn.timer_stop(timer)
     if not callback_fired then
       callback_fired = true
-      local json_str = table.concat(output_parts, "")
-      local context = format_context(json_str)
-      callback(context, nil)
+      if exit_code ~= 0 then
+        callback(nil, "Search failed with exit code " .. exit_code)
+      else
+        local raw_result = table.concat(output_parts, "")
+        callback(raw_result, nil)
+      end
     end
   end
 
@@ -101,184 +109,227 @@ local function execute_search(query, callback)
     on_exit = on_exit,
     stdout_buffered = false,
   })
+
+  if search_job_id <= 0 then
+    callback(nil, "Failed to start search job")
+  end
 end
 
---- Start chat with optional context injected into last user message.
--- @param bufnr number: Neovim buffer number
--- @param messages table: Parsed messages array
--- @param context string|nil: Optional context to prepend to last user message
--- @param system string|nil: Optional system prompt
--- @return number: Job ID
-local function start_chat(bufnr, messages, context, system)
-  -- Read config (with pcall for safety if init not loaded yet)
+--- Execute HTTP request to MiniMax API via curl.
+local function call_api(request_json, callback)
+  local api_key = nil
   local ok, mod = pcall(require, "minimax-chat")
-  local config = (ok and mod and mod.config) or { model = "MiniMax-M2.7", stream = true }
-
-  -- Build mmx command arguments as a list (NOT shell string)
-  local args = { "mmx", "text", "chat", "--stream", "--no-color", "--non-interactive" }
-
-  -- Add model from config if specified
-  if config.model then
-    vim.list_extend(args, { "--model", config.model })
+  if ok and mod and mod.config and mod.config.api_key then
+    api_key = mod.config.api_key
   end
 
-  -- Add system prompt if exists
-  if system and system ~= "" then
-    vim.list_extend(args, { "--system", system })
-  end
-
-  -- Build message args with optional context prepended to last user message
-  local last_user_idx = nil
-  for i = #messages, 1, -1 do
-    if messages[i].role == "user" then
-      last_user_idx = i
-      break
-    end
-  end
-  for i, msg in ipairs(messages) do
-    local content = msg.content
-    if context and msg.role == "user" and i == last_user_idx then
-      content = context .. "\n\n" .. content
-    end
-    vim.list_extend(args, { "--message", msg.role .. ":" .. content })
-  end
-
-  local skip_json = false
-  local partial_line = ""
-
-  local function on_stdout(_, data, _)
-    if data == nil or #data == 0 then
-      return
-    end
-
-    -- Merge with previous partial line
-    if partial_line ~= "" then
-      data[1] = partial_line .. data[1]
-      partial_line = ""
-    end
-
-    local n = #data
-    local last_is_empty = (data[n] == "")
-    local complete_end = last_is_empty and n or (n - 1)
-
-    for i = 1, complete_end do
-      local line = data[i]:gsub("%s+$", "")
-      if skip_json then
-      elseif line == "" then
-      elseif line:find("^{\"") or line:find("^{%s*$") or line:find("^}%s*$") or line:find("\"content\"") then
-        skip_json = true
-      else
-        vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { line })
+  if not api_key then
+    local config_file = vim.fn.expand("~/.mmx/config.json")
+    local f = io.open(config_file, "r")
+    if f then
+      local content = f:read("*a")
+      f:close()
+      local ok2, config = pcall(vim.fn.json_decode, content)
+      if ok2 and config and config.api_key then
+        api_key = config.api_key
       end
     end
-
-    -- Save partial line for next callback
-    if not last_is_empty and n > 0 then
-      partial_line = data[n]
-    end
   end
 
-  local function on_stderr(_, data, _)
-    if data == nil then
-      return
-    end
-    for _, line in ipairs(data) do
-      line = line:gsub("%s+$", "")
-      if line == "" then
-      elseif line:lower():find("^thinking:") then
-        vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { "[THINKING]" })
-      elseif line:lower():find("^response:") then
-        vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { "[ASSISTANT]" })
+  if not api_key then
+    callback(nil, "No API key found")
+    return
+  end
+
+  local request_file = string.format("/tmp/mmx-api-request-%d.json", math.random(1000000))
+  local f = io.open(request_file, "w")
+  if not f then
+    callback(nil, "Failed to write request file")
+    return
+  end
+  f:write(request_json)
+  f:close()
+
+  local args = {
+    "curl", "-s", "-X", "POST",
+    "https://api.minimaxi.com/anthropic/v1/messages",
+    "-H", "Authorization: Bearer " .. api_key,
+    "-H", "Content-Type: application/json",
+    "-H", "anthropic-version: 2023-06-01",
+    "-d", "@" .. request_file
+  }
+
+  local output_parts = {}
+
+  local function on_stdout(_, data, _)
+    if data then
+      for _, line in ipairs(data) do
+        table.insert(output_parts, line)
       end
     end
   end
 
   local function on_exit(_, exit_code, _)
-    M.current_job_id = nil
-
-    -- Flush any remaining partial line
-    if partial_line ~= "" then
-      local line = partial_line:gsub("%s+$", "")
-      if not skip_json and line ~= "" and not (line:find("^{\"") or line:find("^{%s*$") or line:find("^}%s*$") or line:find("\"content\"")) then
-        vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { line })
-      end
-      partial_line = ""
-    end
-
+    os.remove(request_file)
     if exit_code ~= 0 then
-      vim.notify("[minimax-chat] mmx exited with code " .. exit_code, vim.log.levels.ERROR)
+      callback(nil, "curl exited with code " .. exit_code)
+    else
+      local response_json = table.concat(output_parts, "")
+      local ok2, response = pcall(vim.fn.json_decode, response_json)
+      if not ok2 or not response then
+        callback(nil, "Failed to parse API response")
+      else
+        callback(response, nil)
+      end
     end
   end
 
-  -- Append blank line separator before sending for readability
-  vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { "", "---" })
-
-  -- Start the job
-  M.current_job_id = vim.fn.jobstart(args, {
+  local job_id = vim.fn.jobstart(args, {
     on_stdout = on_stdout,
-    on_stderr = on_stderr,
     on_exit = on_exit,
     stdout_buffered = false,
   })
 
-  return M.current_job_id
+  if job_id <= 0 then
+    os.remove(request_file)
+    callback(nil, "Failed to start curl job")
+  end
+end
+
+--- Send non-streaming chat request with tools and handle tool calls.
+local function chat_with_tools(bufnr, messages, system, tools, is_followup)
+  local ok, mod = pcall(require, "minimax-chat")
+  local config = (ok and mod and mod.config) or {}
+
+  local model = config.model or "MiniMax-M2.7"
+
+  local request = {
+    model = model,
+    messages = messages,
+    max_tokens = 4096,
+    tools = tools or { WEB_SEARCH_TOOL },
+  }
+
+  local request_json = vim.fn.json_encode(request)
+
+  vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { "", "---" })
+
+  call_api(request_json, function(response, err)
+    M.current_job_id = nil
+
+    if err then
+      vim.notify("[minimax-chat] API call failed: " .. err, vim.log.levels.ERROR)
+      vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { "[ERROR] " .. err })
+      return
+    end
+
+    local content = response.content or {}
+    local stop_reason = response.stop_reason or "end_turn"
+
+    local tool_name, tool_input = has_tool_call(content)
+
+    if stop_reason == "tool_use" and tool_name and tool_input then
+      local tool_callback = function(raw_result, err2)
+        if err2 then
+          vim.notify("[minimax-chat] Tool execution failed: " .. err2, vim.log.levels.WARN)
+          vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { string.format("[TOOL_ERROR] %s: %s", tool_name, err2) })
+          return
+        end
+
+        local tool_result_content = build_tool_result_content(tool_name, tool_input, raw_result)
+
+        vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, {
+          string.format("[TOOL_CALL] %s(%s)", tool_name, vim.fn.json_encode(tool_input))
+        })
+
+        local tool_result_msg = {
+          role = "assistant",
+          content = content,
+        }
+        local tool_result_as_content = {
+          type = "tool_result",
+          tool_name = tool_name,
+          content = tool_result_content,
+        }
+
+        local followup_messages = vim.deepcopy(messages)
+        table.insert(followup_messages, tool_result_msg)
+        table.insert(followup_messages, {
+          role = "user",
+          content = { tool_result_as_content }
+        })
+
+        vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { "[TOOL_RESULT]", tool_result_content })
+
+        chat_with_tools(bufnr, followup_messages, system, tools, true)
+      end
+
+      if tool_name == "web_search" then
+        local query = tool_input and tool_input.query
+        if query then
+          execute_search(query, tool_callback)
+        else
+          vim.notify("[minimax-chat] Tool web_search called without query input", vim.log.levels.WARN)
+        end
+      else
+        vim.notify("[minimax-chat] Unknown tool: " .. tool_name, vim.log.levels.WARN)
+      end
+    else
+      vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { "[ASSISTANT]" })
+
+      for _, item in ipairs(content) do
+        if item.type == "text" then
+          local lines = vim.split(item.text or "", "\n", { plain = true })
+          for _, line in ipairs(lines) do
+            vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { line })
+          end
+        elseif item.type == "thinking" then
+          vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { "[THINKING] " .. (item.thinking or "") })
+        elseif item.type == "tool_use" then
+          vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, {
+            string.format("[TOOL_CALL] %s(%s)", item.name or "unknown", vim.fn.json_encode(item.input or {}))
+          })
+        end
+      end
+
+      if is_followup then
+        vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { "[END]" })
+      end
+    end
+  end)
+
+  M.current_job_id = 1
 end
 
 --- Main entry point for sending buffer content to mmx CLI.
--- @param bufnr number: Neovim buffer number
 function M.send(bufnr)
-  -- Guard against duplicate sends
   if M.current_job_id ~= nil then
     vim.notify("[minimax-chat] Already sending, please wait for current job to complete", vim.log.levels.WARN)
     return
   end
 
-  -- Check if mmx is available
-  if vim.fn.executable("mmx") ~= 1 then
-    vim.notify("[minimax-chat] 'mmx' command not found. Please install MiniMax CLI.", vim.log.levels.ERROR)
+  if vim.fn.executable("curl") ~= 1 then
+    vim.notify("[minimax-chat] 'curl' command not found", vim.log.levels.ERROR)
     return
   end
 
-  -- Parse buffer to get messages
   local parse_mod = require("minimax-chat.parse")
   local parsed = parse_mod.parse_buffer(bufnr)
 
-  -- Validate we have messages to send
   if #parsed.messages == 0 then
     vim.notify("[minimax-chat] Nothing to send", vim.log.levels.WARN)
     return
   end
 
-  -- Read config
   local ok, mod = pcall(require, "minimax-chat")
-  local config = (ok and mod and mod.config) or { model = "MiniMax-M2.7", stream = true, search_enabled = true }
+  local config = (ok and mod and mod.config) or {}
 
-  -- Check for [SEARCH] markers in user messages (scan in reverse to find LAST one)
-  local search_query = nil
-  for i = #parsed.messages, 1, -1 do
-    local msg = parsed.messages[i]
-    if msg.role == "user" then
-      local result = extract_search_query(msg.content)
-      if result.query then
-        search_query = result.query
-        msg.content = result.cleaned
-        break  -- Use the LAST (most recent) search query found
-      end
-    end
+  local tools = config.tools
+  if tools == nil then
+    tools = { WEB_SEARCH_TOOL }
   end
 
-  -- Two-phase flow: if search_enabled and we found a search query
-  if config.search_enabled and search_query then
-    execute_search(search_query, function(context, err)
-      if err then
-        vim.notify("[minimax-chat] Search failed: " .. err, vim.log.levels.WARN)
-      end
-      start_chat(bufnr, parsed.messages, context, parsed.system)
-    end)
-  else
-    -- Direct chat without search
-    start_chat(bufnr, parsed.messages, nil, parsed.system)
-  end
+  chat_with_tools(bufnr, parsed.messages, parsed.system, tools, false)
 end
 
 return M
