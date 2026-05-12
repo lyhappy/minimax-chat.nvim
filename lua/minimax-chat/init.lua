@@ -14,6 +14,7 @@ local defaults = {
 	model = "MiniMax-M2.7",
 	stream = true,
 	timeout = 60,
+	search_enabled = true,
 }
 
 ---Module configuration, accessible via require('minimax-chat').config

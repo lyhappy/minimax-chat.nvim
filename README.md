@@ -30,6 +30,7 @@ require("minimax-chat").setup({
     model = "MiniMax-M2.7",        -- default model
     stream = true,                 -- stream responses
     timeout = 60,                  -- job timeout in seconds
+    search_enabled = true,         -- enable [SEARCH] marker support
 })
 ```
 
@@ -70,12 +71,14 @@ buffer content to MiniMax. The response is streamed to the buffer.
 | `[USER]` | User message |
 | `[ASSISTANT]` | Assistant response |
 | `[THINKING]` | Model reasoning (auto-generated) |
+| `[SEARCH]` | Web search query (inline in [USER] block, results injected as context) |
 
 ## How It Works
 
 1. Press Shift+Enter → `[SYSTEM]`, `[USER]`, and `[ASSISTANT]` markers are parsed
-2. Messages are sent to `mmx text chat --stream`
-3. Response is streamed back and appended to the buffer with `[THINKING]`/`[ASSISTANT]` markers
+2. If `[SEARCH]<query>` is present in [USER], the plugin runs `mmx search query` and injects results as `[CONTEXT]` before sending to the model
+3. Messages are sent to `mmx text chat --stream`
+4. Response is streamed back and appended to the buffer with `[THINKING]`/`[ASSISTANT]` markers
 
 ## License
 
