@@ -259,7 +259,8 @@ local function chat_with_tools(bufnr, messages, system, tools, is_followup)
           content = { tool_result_as_content }
         })
 
-        vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, { "[TOOL_RESULT]", tool_result_content })
+        vim.api.nvim_buf_set_lines(bufnr, -1, -1, false,
+          vim.list_extend({ "[TOOL_RESULT]" }, vim.split(tool_result_content, "\n", { plain = true })))
 
         chat_with_tools(bufnr, followup_messages, system, tools, true)
       end
