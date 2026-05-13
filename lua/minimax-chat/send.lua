@@ -42,6 +42,14 @@ local function build_tool_result_content(name, input, raw_result)
   local organic = data.organic or {}
   local lines = { string.format("Tool: %s", name) }
 
+  -- Helper to sanitize string for JSON encoding (remove invalid UTF-8 bytes)
+  local function sanitize(s)
+    if not s then return "" end
+    -- Replace any byte that doesn't start valid UTF-8 sequence with '?'
+    local result = s:gsub("[^\x09\x0A\x0D\x20-\x7E\xC0-\xFF]", "?")
+    return result
+  end
+
   if name == "web_search" then
     local query = input and input.query or "unknown"
     table.insert(lines, string.format("Query: %s", query))
@@ -53,14 +61,20 @@ local function build_tool_result_content(name, input, raw_result)
       local max_entries = math.min(5, #organic)
       for i = 1, max_entries do
         local item = organic[i]
-        local title = item.title or "No title"
-        local snippet = (item.snippet or ""):sub(1, 150)
-        local link = item.link or ""
+        local title = sanitize(item.title or "No title")
+        local snippet = sanitize((item.snippet or ""):sub(1, 150))
+        local link = sanitize(item.link or "")
         table.insert(lines, string.format("%d. %s: %s (%s)", i, title, snippet, link))
       end
     end
   else
-    table.insert(lines, vim.fn.json_encode(data))
+    -- For unknown tools, use json_encode but wrap in pcall
+    local ok2, encoded = pcall(vim.fn.json_encode, data)
+    if ok2 then
+      table.insert(lines, encoded)
+    else
+      table.insert(lines, "[raw result]")
+    end
   end
 
   return table.concat(lines, "\n")
