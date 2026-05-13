@@ -32,6 +32,22 @@ local function has_tool_call(content)
   return nil, nil
 end
 
+--- Strip HTML tags and decode basic HTML entities from string.
+local function strip_html(s)
+  if not s then return "" end
+  -- Remove HTML tags
+  s = s:gsub("<[^>]+>", "")
+  -- Decode common HTML entities
+  s = s:gsub("&lt;", "<")
+  s = s:gsub("&gt;", ">")
+  s = s:gsub("&amp;", "&")
+  s = s:gsub("&quot;", '"')
+  s = s:gsub("&apos;", "'")
+  s = s:gsub("&#(%d+);", function(n) return string.char(tonumber(n)) end)
+  s = s:gsub("&#x(%x+);", function(n) return string.char(tonumber(n, 16)) end)
+  return s
+end
+
 --- Build a tool result content block from raw JSON result.
 local function build_tool_result_content(name, input, raw_result)
   local ok, data = pcall(vim.fn.json_decode, raw_result)
@@ -41,14 +57,6 @@ local function build_tool_result_content(name, input, raw_result)
 
   local organic = data.organic or {}
   local lines = { string.format("Tool: %s", name) }
-
-  -- Helper to sanitize string for JSON encoding (remove invalid UTF-8 bytes)
-  local function sanitize(s)
-    if not s then return "" end
-    -- Replace any byte that doesn't start valid UTF-8 sequence with '?'
-    local result = s:gsub("[^\x09\x0A\x0D\x20-\x7E\xC0-\xFF]", "?")
-    return result
-  end
 
   if name == "web_search" then
     local query = input and input.query or "unknown"
@@ -61,9 +69,9 @@ local function build_tool_result_content(name, input, raw_result)
       local max_entries = math.min(5, #organic)
       for i = 1, max_entries do
         local item = organic[i]
-        local title = sanitize(item.title or "No title")
-        local snippet = sanitize((item.snippet or ""):sub(1, 150))
-        local link = sanitize(item.link or "")
+        local title = strip_html(item.title or "No title"):sub(1, 100)
+        local snippet = strip_html(item.snippet or ""):sub(1, 200)
+        local link = item.link or ""
         table.insert(lines, string.format("%d. %s: %s (%s)", i, title, snippet, link))
       end
     end
